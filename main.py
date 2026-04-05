@@ -1,11 +1,13 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 import os
+from typing import Optional
+
 import requests
 from dotenv import load_dotenv
 import psycopg
 from psycopg.rows import dict_row
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 load_dotenv()
 
@@ -15,6 +17,7 @@ STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
 APP_BASE_URL = os.getenv("APP_BASE_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN")
 
 DEFAULT_USER_ID = "default_user"
 
@@ -29,6 +32,14 @@ def unix_to_timestamptz(unix_ts):
     if not unix_ts:
         return None
     return datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+
+
+def verify_api_key(authorization: Optional[str]):
+    expected = f"Bearer {API_AUTH_TOKEN}"
+    if not API_AUTH_TOKEN:
+        raise HTTPException(status_code=500, detail="API_AUTH_TOKEN is not configured")
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def save_service_token(service_name, user_id, access_token, refresh_token, expires_at, scope=None):
@@ -108,215 +119,23 @@ def refresh_strava_access_token(user_id):
         scope=token.get("scope"),
     )
 
-    # IMPORTANT: return the newly saved token directly from DB helper,
-    # not from get_valid_strava_token()
     return get_service_token("strava", user_id)
 
+
 def get_valid_strava_token(user_id):
-    token = get_valid_strava_token(DEFAULT_USER_ID)
+    token = get_service_token("strava", user_id)
 
     if not token:
         raise ValueError("No Strava token found")
 
     expires_at = token.get("expires_at")
-
-    if expires_at is None:
-        return refresh_strava_access_token(user_id)
-
     now_utc = datetime.now(timezone.utc)
 
-    if expires_at <= now_utc + timedelta(hours=1):
+    if expires_at is None or expires_at <= now_utc + timedelta(hours=1):
         return refresh_strava_access_token(user_id)
 
     return token
-@app.get("/strava/force-refresh")
-def strava_force_refresh():
-    try:
-        token = refresh_strava_access_token(DEFAULT_USER_ID)
-        return {
-            "ok": True,
-            "access_token_present": bool(token.get("access_token")),
-            "refresh_token_present": bool(token.get("refresh_token")),
-            "expires_at": str(token.get("expires_at")),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
-@app.get("/")
-def root():
-    return {
-        "message": "API is running. Try /health, /env-check, /auth/strava/start, /strava/token-status, or /strava/activities"
-    }
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "message": "training coach api is running"}
-
-
-@app.get("/env-check")
-def env_check():
-    return {
-        "has_strava_client_id": bool(STRAVA_CLIENT_ID),
-        "has_strava_client_secret": bool(STRAVA_CLIENT_SECRET),
-        "has_app_base_url": bool(APP_BASE_URL),
-        "has_database_url": bool(DATABASE_URL),
-        "app_base_url": APP_BASE_URL,
-    }
-
-
-@app.get("/auth/strava/start")
-def auth_strava_start():
-    if not STRAVA_CLIENT_ID or not APP_BASE_URL:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Missing STRAVA_CLIENT_ID or APP_BASE_URL"}
-        )
-
-    base_url = APP_BASE_URL.rstrip("/")
-    redirect_uri = f"{base_url}/auth/strava/callback"
-
-    auth_url = (
-        "https://www.strava.com/oauth/authorize"
-        f"?client_id={STRAVA_CLIENT_ID}"
-        "&response_type=code"
-        f"&redirect_uri={redirect_uri}"
-        "&approval_prompt=force"
-        "&scope=activity:read_all"
-    )
-    return RedirectResponse(auth_url)
-
-
-@app.get("/auth/strava/callback")
-def auth_strava_callback(request: Request):
-    query_params = dict(request.query_params)
-
-    error = query_params.get("error")
-    code = query_params.get("code")
-
-    if error:
-        return {"ok": False, "error": error, "query_params": query_params}
-
-    if not code:
-        return {"ok": False, "error": "No code returned from Strava", "query_params": query_params}
-
-    token_response = requests.post(
-        "https://www.strava.com/oauth/token",
-        data={
-            "client_id": STRAVA_CLIENT_ID,
-            "client_secret": STRAVA_CLIENT_SECRET,
-            "code": code,
-            "grant_type": "authorization_code",
-        },
-        timeout=30,
-    )
-
-    token_data = token_response.json()
-
-    if token_response.ok:
-        save_service_token(
-            service_name="strava",
-            user_id=DEFAULT_USER_ID,
-            access_token=token_data.get("access_token"),
-            refresh_token=token_data.get("refresh_token"),
-            expires_at=unix_to_timestamptz(token_data.get("expires_at")),
-            scope=token_data.get("scope"),
-        )
-
-    return {
-        "ok": token_response.ok,
-        "saved_to_db": token_response.ok,
-        "token_data": {
-            "access_token_present": bool(token_data.get("access_token")),
-            "refresh_token_present": bool(token_data.get("refresh_token")),
-            "expires_at": token_data.get("expires_at"),
-            "athlete_id_present": bool(token_data.get("athlete", {}).get("id")),
-        },
-    }
-
-
-@app.get("/strava/token-status")
-def strava_token_status():
-    try:
-        token = get_valid_strava_token(DEFAULT_USER_ID)
-
-        if not token:
-            return {"ok": False, "message": "No Strava token saved in database yet"}
-
-        return {
-            "ok": True,
-            "service_name": token.get("service_name"),
-            "user_id": token.get("user_id"),
-            "access_token_present": bool(token.get("access_token")),
-            "refresh_token_present": bool(token.get("refresh_token")),
-            "expires_at": str(token.get("expires_at")),
-            "scope": token.get("scope"),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@app.get("/strava/activities")
-def strava_activities(per_page: int = 5):
-    token = get_valid_strava_token(DEFAULT_USER_ID)
-
-    if not token or not token.get("access_token"):
-        return JSONResponse(
-            status_code=401,
-            content={"ok": False, "error": "No Strava access token available. Connect Strava first."}
-        )
-
-    response = requests.get(
-        "https://www.strava.com/api/v3/athlete/activities",
-        headers={"Authorization": f"Bearer {token['access_token']}"},
-        params={"per_page": per_page},
-        timeout=30,
-    )
-
-    try:
-        data = response.json()
-    except Exception:
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": "Could not parse Strava activities response"}
-        )
-
-    if not response.ok:
-        return JSONResponse(
-            status_code=response.status_code,
-            content={"ok": False, "error": data}
-        )
-
-    simplified = []
-    for act in data:
-        simplified.append({
-            "id": act.get("id"),
-            "name": act.get("name"),
-            "type": act.get("type"),
-            "start_date": act.get("start_date"),
-            "distance_meters": act.get("distance"),
-            "moving_time_seconds": act.get("moving_time"),
-            "elapsed_time_seconds": act.get("elapsed_time"),
-            "total_elevation_gain": act.get("total_elevation_gain"),
-            "average_heartrate": act.get("average_heartrate"),
-            "max_heartrate": act.get("max_heartrate"),
-        })
-
-    return {
-        "ok": True,
-        "count": len(simplified),
-        "activities": simplified,
-    }
-
-@app.get("/db-test")
-def db_test():
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("select now() as current_time")
-                row = cur.fetchone()
-        return {"ok": True, "row": row}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 def save_strava_activity(user_id, activity):
     with get_db_connection() as conn:
@@ -395,93 +214,47 @@ def get_recent_strava_activities(user_id, limit=10):
             )
             return cur.fetchall()
 
-@app.get("/strava/import-activities")
-def import_strava_activities(per_page: int = 30):
-    token = get_valid_strava_token(DEFAULT_USER_ID)
 
-    if not token or not token.get("access_token"):
-        return JSONResponse(
-            status_code=401,
-            content={"ok": False, "error": "No Strava access token available. Connect Strava first."}
-        )
-
-    response = requests.get(
-        "https://www.strava.com/api/v3/athlete/activities",
-        headers={"Authorization": f"Bearer {token['access_token']}"},
-        params={"per_page": per_page},
-        timeout=30,
-    )
-
-    try:
-        data = response.json()
-    except Exception:
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": "Could not parse Strava activities response"}
-        )
-
-    if not response.ok:
-        return JSONResponse(
-            status_code=response.status_code,
-            content={"ok": False, "error": data}
-        )
-
-    saved_count = 0
-    try:
-        for activity in data:
-            save_strava_activity(DEFAULT_USER_ID, activity)
-            saved_count += 1
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "ok": False,
-                "saved_count_before_error": saved_count,
-                "error": str(e),
-            }
-        )
-
-    return {
-        "ok": True,
-        "saved_count": saved_count,
-        "message": "Activities imported successfully"
-    }
-
-@app.get("/summary/build")
-def summary_build():
-    summary = build_strava_summary(DEFAULT_USER_ID)
-    save_daily_training_summary(summary)
-    return {"ok": True, "summary": summary}
+def save_daily_pain_check(check_date, pain_score, notes=None):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into daily_pain_check (
+                    check_date,
+                    pain_score,
+                    notes,
+                    updated_at
+                )
+                values (%s, %s, %s, now())
+                on conflict (check_date)
+                do update set
+                    pain_score = excluded.pain_score,
+                    notes = excluded.notes,
+                    updated_at = now()
+                """,
+                (check_date, pain_score, notes),
+            )
+        conn.commit()
 
 
-@app.get("/today-summary")
-def today_summary():
-    summary = get_today_summary()
+def get_daily_pain_check(check_date):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select check_date, pain_score, notes
+                from daily_pain_check
+                where check_date = %s
+                """,
+                (check_date,),
+            )
+            return cur.fetchone()
 
-    if not summary:
-        return {
-            "ok": False,
-            "message": "No summary for today yet. Run /summary/build first."
-        }
-
-    return {
-        "ok": True,
-        "summary": summary,
-    }
-
-@app.get("/strava/recent-db-activities")
-def recent_db_activities(limit: int = 10):
-    rows = get_recent_strava_activities(DEFAULT_USER_ID, limit=limit)
-    return {
-        "ok": True,
-        "count": len(rows),
-        "activities": rows,
-    }
 
 def build_strava_summary(user_id):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            # main load metrics
             cur.execute(
                 """
                 select
@@ -512,7 +285,6 @@ def build_strava_summary(user_id):
             )
             totals = cur.fetchone()
 
-            # recent activity
             cur.execute(
                 """
                 select type, start_date
@@ -525,7 +297,6 @@ def build_strava_summary(user_id):
             )
             last_activity = cur.fetchone()
 
-            # distinct run days in last 7 days
             cur.execute(
                 """
                 select count(*) as run_days_7d
@@ -541,7 +312,6 @@ def build_strava_summary(user_id):
             )
             run_days_row = cur.fetchone()
 
-            # did they run yesterday?
             cur.execute(
                 """
                 select count(*) as ran_yesterday
@@ -554,7 +324,6 @@ def build_strava_summary(user_id):
             )
             yesterday_row = cur.fetchone()
 
-            # did they run today already?
             cur.execute(
                 """
                 select count(*) as ran_today
@@ -584,13 +353,11 @@ def build_strava_summary(user_id):
     pain_score = pain_row["pain_score"] if pain_row else None
     pain_notes = pain_row["notes"] if pain_row else None
 
-    # ramp ratio: current 7d / previous 7d
     if run_seconds_prev_7d > 0:
         load_ratio = run_seconds_7d / run_seconds_prev_7d
     else:
         load_ratio = None
 
-    # long run share of weekly load
     if run_seconds_7d > 0:
         long_run_share = long_run_seconds_14d / run_seconds_7d
     else:
@@ -601,7 +368,6 @@ def build_strava_summary(user_id):
     reason_codes = []
     coach_note = ""
 
-    # pain override comes first
     if pain_score is not None and pain_score >= 4:
         recovery_status = "red"
         recommended_session = "rest"
@@ -686,6 +452,7 @@ def build_strava_summary(user_id):
         "pain_score": pain_score,
         "pain_notes": pain_notes,
     }
+
 
 def save_daily_training_summary(summary):
     with get_db_connection() as conn:
@@ -781,94 +548,121 @@ def get_today_summary():
             )
             return cur.fetchone()
 
-@app.get("/refresh-data")
-def refresh_data():
-    # 1. import latest activities
-    token = get_valid_strava_token(DEFAULT_USER_ID)
 
-    if not token or not token.get("access_token"):
-        return {
-            "ok": False,
-            "error": "No Strava token available"
-        }
+@app.get("/")
+def root():
+    return {
+        "message": "API is running. Try /health, /env-check, /auth/strava/start, /strava/token-status, /refresh-data, or /today-summary"
+    }
 
-    response = requests.get(
-        "https://www.strava.com/api/v3/athlete/activities",
-        headers={"Authorization": f"Bearer {token['access_token']}"},
-        params={"per_page": 30},
+
+@app.get("/health")
+def health():
+    return {"ok": True, "message": "training coach api is running"}
+
+
+@app.get("/env-check")
+def env_check():
+    return {
+        "has_strava_client_id": bool(STRAVA_CLIENT_ID),
+        "has_strava_client_secret": bool(STRAVA_CLIENT_SECRET),
+        "has_app_base_url": bool(APP_BASE_URL),
+        "has_database_url": bool(DATABASE_URL),
+        "has_api_auth_token": bool(API_AUTH_TOKEN),
+        "app_base_url": APP_BASE_URL,
+    }
+
+
+@app.get("/auth/strava/start")
+def auth_strava_start():
+    if not STRAVA_CLIENT_ID or not APP_BASE_URL:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Missing STRAVA_CLIENT_ID or APP_BASE_URL"}
+        )
+
+    base_url = APP_BASE_URL.rstrip("/")
+    redirect_uri = f"{base_url}/auth/strava/callback"
+
+    auth_url = (
+        "https://www.strava.com/oauth/authorize"
+        f"?client_id={STRAVA_CLIENT_ID}"
+        "&response_type=code"
+        f"&redirect_uri={redirect_uri}"
+        "&approval_prompt=force"
+        "&scope=activity:read_all"
+    )
+    return RedirectResponse(auth_url)
+
+
+@app.get("/auth/strava/callback")
+def auth_strava_callback(request: Request):
+    query_params = dict(request.query_params)
+
+    error = query_params.get("error")
+    code = query_params.get("code")
+
+    if error:
+        return {"ok": False, "error": error, "query_params": query_params}
+
+    if not code:
+        return {"ok": False, "error": "No code returned from Strava", "query_params": query_params}
+
+    token_response = requests.post(
+        "https://www.strava.com/oauth/token",
+        data={
+            "client_id": STRAVA_CLIENT_ID,
+            "client_secret": STRAVA_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+        },
         timeout=30,
     )
 
-    if not response.ok:
-        return {"ok": False, "error": response.json()}
+    token_data = token_response.json()
 
-    data = response.json()
-
-    saved_count = 0
-    for activity in data:
-        save_strava_activity(DEFAULT_USER_ID, activity)
-        saved_count += 1
-
-    # 2. rebuild summary
-    summary = build_strava_summary(DEFAULT_USER_ID)
-    save_daily_training_summary(summary)
+    if token_response.ok:
+        save_service_token(
+            service_name="strava",
+            user_id=DEFAULT_USER_ID,
+            access_token=token_data.get("access_token"),
+            refresh_token=token_data.get("refresh_token"),
+            expires_at=unix_to_timestamptz(token_data.get("expires_at")),
+            scope=token_data.get("scope"),
+        )
 
     return {
-        "ok": True,
-        "imported_activities": saved_count,
-        "summary": summary
+        "ok": token_response.ok,
+        "saved_to_db": token_response.ok,
+        "token_data": {
+            "access_token_present": bool(token_data.get("access_token")),
+            "refresh_token_present": bool(token_data.get("refresh_token")),
+            "expires_at": token_data.get("expires_at"),
+            "athlete_id_present": bool(token_data.get("athlete", {}).get("id")),
+        },
     }
-from datetime import datetime, timezone, timedelta
-
-def save_daily_pain_check(check_date, pain_score, notes=None):
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into daily_pain_check (
-                    check_date,
-                    pain_score,
-                    notes,
-                    updated_at
-                )
-                values (%s, %s, %s, now())
-                on conflict (check_date)
-                do update set
-                    pain_score = excluded.pain_score,
-                    notes = excluded.notes,
-                    updated_at = now()
-                """,
-                (check_date, pain_score, notes),
-            )
-        conn.commit()
 
 
-def get_daily_pain_check(check_date):
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select check_date, pain_score, notes
-                from daily_pain_check
-                where check_date = %s
-                """,
-                (check_date,),
-            )
-            return cur.fetchone()
+@app.get("/strava/token-status")
+def strava_token_status():
+    try:
+        token = get_valid_strava_token(DEFAULT_USER_ID)
 
-def get_valid_strava_token(user_id):
-    token = get_service_token("strava", user_id)
+        if not token:
+            return {"ok": False, "message": "No Strava token saved in database yet"}
 
-    if not token:
-        raise ValueError("No Strava token found")
+        return {
+            "ok": True,
+            "service_name": token.get("service_name"),
+            "user_id": token.get("user_id"),
+            "access_token_present": bool(token.get("access_token")),
+            "refresh_token_present": bool(token.get("refresh_token")),
+            "expires_at": str(token.get("expires_at")),
+            "scope": token.get("scope"),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-    expires_at = token.get("expires_at")
-    now_utc = datetime.now(timezone.utc)
-
-    if expires_at is None or expires_at <= now_utc + timedelta(hours=1):
-        return refresh_strava_access_token(user_id)
-
-    return token
 
 @app.get("/strava/force-refresh")
 def strava_force_refresh():
@@ -883,8 +677,168 @@ def strava_force_refresh():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
+@app.get("/strava/activities")
+def strava_activities(per_page: int = 5):
+    token = get_valid_strava_token(DEFAULT_USER_ID)
+
+    if not token or not token.get("access_token"):
+        return JSONResponse(
+            status_code=401,
+            content={"ok": False, "error": "No Strava access token available. Connect Strava first."}
+        )
+
+    response = requests.get(
+        "https://www.strava.com/api/v3/athlete/activities",
+        headers={"Authorization": f"Bearer {token['access_token']}"},
+        params={"per_page": per_page},
+        timeout=30,
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "Could not parse Strava activities response"}
+        )
+
+    if not response.ok:
+        return JSONResponse(
+            status_code=response.status_code,
+            content={"ok": False, "error": data}
+        )
+
+    simplified = []
+    for act in data:
+        simplified.append({
+            "id": act.get("id"),
+            "name": act.get("name"),
+            "type": act.get("type"),
+            "start_date": act.get("start_date"),
+            "distance_meters": act.get("distance"),
+            "moving_time_seconds": act.get("moving_time"),
+            "elapsed_time_seconds": act.get("elapsed_time"),
+            "total_elevation_gain": act.get("total_elevation_gain"),
+            "average_heartrate": act.get("average_heartrate"),
+            "max_heartrate": act.get("max_heartrate"),
+        })
+
+    return {
+        "ok": True,
+        "count": len(simplified),
+        "activities": simplified,
+    }
+
+
+@app.get("/db-test")
+def db_test():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select now() as current_time")
+                row = cur.fetchone()
+        return {"ok": True, "row": row}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/strava/import-activities")
+def import_strava_activities(per_page: int = 30):
+    token = get_valid_strava_token(DEFAULT_USER_ID)
+
+    if not token or not token.get("access_token"):
+        return JSONResponse(
+            status_code=401,
+            content={"ok": False, "error": "No Strava access token available. Connect Strava first."}
+        )
+
+    response = requests.get(
+        "https://www.strava.com/api/v3/athlete/activities",
+        headers={"Authorization": f"Bearer {token['access_token']}"},
+        params={"per_page": per_page},
+        timeout=30,
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "Could not parse Strava activities response"}
+        )
+
+    if not response.ok:
+        return JSONResponse(
+            status_code=response.status_code,
+            content={"ok": False, "error": data}
+        )
+
+    saved_count = 0
+    try:
+        for activity in data:
+            save_strava_activity(DEFAULT_USER_ID, activity)
+            saved_count += 1
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "saved_count_before_error": saved_count,
+                "error": str(e),
+            }
+        )
+
+    return {
+        "ok": True,
+        "saved_count": saved_count,
+        "message": "Activities imported successfully"
+    }
+
+
+@app.get("/strava/recent-db-activities")
+def recent_db_activities(limit: int = 10):
+    rows = get_recent_strava_activities(DEFAULT_USER_ID, limit=limit)
+    return {
+        "ok": True,
+        "count": len(rows),
+        "activities": rows,
+    }
+
+
+@app.get("/summary/build")
+def summary_build():
+    summary = build_strava_summary(DEFAULT_USER_ID)
+    save_daily_training_summary(summary)
+    return {"ok": True, "summary": summary}
+
+
+@app.get("/today-summary")
+def today_summary(authorization: Optional[str] = Header(None)):
+    verify_api_key(authorization)
+
+    summary = get_today_summary()
+
+    if not summary:
+        return {
+            "ok": False,
+            "message": "No summary for today yet. Run /refresh-data first."
+        }
+
+    return {
+        "ok": True,
+        "summary": summary,
+    }
+
+
 @app.get("/set-pain-level")
-def set_pain_level(score: int, notes: str | None = None):
+def set_pain_level(
+    score: int,
+    notes: Optional[str] = None,
+    authorization: Optional[str] = Header(None)
+):
+    verify_api_key(authorization)
+
     if score < 0 or score > 10:
         return JSONResponse(
             status_code=400,
@@ -918,8 +872,14 @@ def today_pain():
         "pain": row,
     }
 
+
 @app.get("/refresh-data")
-def refresh_data(per_page: int = 30):
+def refresh_data(
+    per_page: int = 30,
+    authorization: Optional[str] = Header(None)
+):
+    verify_api_key(authorization)
+
     try:
         token = get_valid_strava_token(DEFAULT_USER_ID)
     except Exception as e:
